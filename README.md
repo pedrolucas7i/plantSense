@@ -1,8 +1,8 @@
 # ESP32 PlantSense 🌿
 
 <p align="center">
-  <img src="images/dashboard.jpeg" alt="PlantSense Dashboard" width="480">
-  <img src="images/sensor.jpeg" alt="Plant Sensor Module" width="240">
+  <img src="images/dashboard.jpeg" alt="PlantSense Dashboard">
+  <img src="images/sensor.jpeg" alt="Plant Sensor Module">
 </p>
 
 **ESP32 PlantSense** is a polished, premium-quality plant monitoring system built around an ESP32 microcontroller. Ideal for makers and urban gardeners, it delivers real‑time analytics on soila moisture, air temperature, and humidity through a dark‑mode web dashboard that mirrors the look & feel of modern IoT products. The interface uses a clean color palette and rounded geometry that you can adapt for your own documentation or branding.
