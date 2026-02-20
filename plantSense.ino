@@ -1,173 +1,109 @@
-// ESP32 PlantSense
+/*
+ * ------------------------------------------------------------
+ *  ESP32 PlantSense
+ *  Low-Power WiFi Soil & Environment Monitoring Node
+ *
+ *  Features:
+ *   - Capacitive soil moisture sensor
+ *   - DHT11 temperature & humidity sensor
+ *   - Embedded HTTP server
+ *   - mDNS support (plant.local)
+ *   - CPU frequency reduced to 80 MHz
+ *
+ *  Power Optimization Strategy:
+ *   - Sensors are read only on client request
+ *   - WiFi MAX_MODEM power save enabled
+ *   - No background polling
+ * ------------------------------------------------------------
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include <LittleFS.h>
-#include <ArduinoJson.h>
+#include <DHT.h>
+#include <esp_wifi.h>
 
-const char* ssid     = "YOUR-SSID";
-const char* password = "YPUR-SSID-PASSWORD";
-const int   port     = 80;
+// ─────────────────────────────────────────────
+// Network Configuration
+// ─────────────────────────────────────────────
 
-WebServer server(port);
+const char* ssid     = "YOUR_SSID_HERE";
+const char* password = "YOUR_PASSWORD_HERE";
+const int   HTTP_PORT = 80;
 
-const int led = 2;
+WebServer server(HTTP_PORT);
 
-// DHT11
-#include "DHT.h"
-#define DHTPIN  22
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
+// ─────────────────────────────────────────────
+// Hardware Configuration
+// ─────────────────────────────────────────────
 
-// Sensor de humidade do solo (capacitivo)
-float asoilmoist = 0.0f;
+#define LED_PIN   2
+#define SOIL_PIN  32
+#define DHT_PIN   22
+#define DHT_TYPE  DHT11
 
-// ────────────────────────────────────────────────
-// Configuração do histórico em LittleFS
-// ────────────────────────────────────────────────
-const char* HISTORY_FILE = "/history.json";
-const size_t MAX_HISTORY_POINTS = 500;
-const unsigned long SAVE_INTERVAL_MS = 300000;  // 5 minutos = 300000 ms
+DHT dht(DHT_PIN, DHT_TYPE);
 
-unsigned long lastSaveTime = 0;
+// Smoothed soil ADC value
+float soilFiltered = 0.0f;
 
-// Estrutura simples para cada leitura
-struct Reading {
-  uint32_t timestamp;   // segundos desde boot (millis()/1000)
-  uint8_t moisture;
-  int8_t temp;          // -20 a 60
-  uint8_t humidity;
-};
+// Soil calibration constants (adjust if needed)
+constexpr float SOIL_MIN = 2000.0f;  // Sensor fully in water
+constexpr float SOIL_MAX = 3344.0f;  // Sensor in dry air
 
-std::vector<Reading> history;  // vector dinâmico (usa heap)
+// ─────────────────────────────────────────────
+// Sensor Reading Routine
+// Reads sensors only when explicitly requested
+// ─────────────────────────────────────────────
 
-// Carrega histórico do LittleFS no boot
-void loadHistory() {
-  history.clear();
+void readSensors(int &soilPercent,
+                 float &temperature,
+                 float &humidity,
+                 bool  &validReading)
+{
+    // Apply light exponential smoothing to soil ADC
+    float raw = analogRead(SOIL_PIN);
+    soilFiltered = 0.9f * soilFiltered + 0.1f * raw;
 
-  if (!LittleFS.exists(HISTORY_FILE)) {
-    Serial.println("Arquivo de histórico não existe ainda");
-    return;
-  }
+    float moisture =
+        100.0f - ((soilFiltered - SOIL_MIN) /
+                 (SOIL_MAX - SOIL_MIN) * 100.0f);
 
-  File file = LittleFS.open(HISTORY_FILE, "r");
-  if (!file) {
-    Serial.println("Falha ao abrir " + String(HISTORY_FILE) + " para leitura");
-    return;
-  }
+    moisture = constrain(moisture, 0.0f, 100.0f);
+    soilPercent = static_cast<int>(round(moisture));
 
-  DynamicJsonDocument doc(8192);
-  DeserializationError error = deserializeJson(doc, file);
-  file.close();
+    humidity    = dht.readHumidity();
+    temperature = dht.readTemperature();
 
-  if (error) {
-    Serial.print("deserializeJson() falhou: ");
-    Serial.println(error.c_str());
-    return;
-  }
-
-  JsonArray arr = doc.as<JsonArray>();
-  for (JsonObject obj : arr) {
-    Reading r;
-    r.timestamp  = obj["ts"]   | 0;
-    r.moisture   = obj["m"]    | 0;
-    r.temp       = obj["t"]    | 0;
-    r.humidity   = obj["h"]    | 0;
-    history.push_back(r);
-  }
-
-  Serial.printf("Carregado %d pontos do histórico\n", history.size());
+    validReading = !isnan(humidity) && !isnan(temperature);
 }
 
-// Salva histórico no LittleFS (só quando necessário)
-bool saveHistory() {
-  if (history.empty()) return true;
+// ─────────────────────────────────────────────
+// HTTP Root Handler (HTML UI)
+// ─────────────────────────────────────────────
 
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.to<JsonArray>();
+void handleRoot()
+{
+    digitalWrite(LED_PIN, HIGH);
 
-  for (const auto& r : history) {
-    JsonObject obj = arr.createNestedObject();
-    obj["ts"] = r.timestamp;
-    obj["m"]  = r.moisture;
-    obj["t"]  = r.temp;
-    obj["h"]  = r.humidity;
-  }
+    int soil;
+    float temp, hum;
+    bool ok;
 
-  File file = LittleFS.open(HISTORY_FILE, "w");
-  if (!file) {
-    Serial.println("Falha ao abrir " + String(HISTORY_FILE) + " para escrita");
-    return false;
-  }
+    readSensors(soil, temp, hum, ok);
 
-  serializeJson(doc, file);
-  file.close();
-  Serial.printf("Histórico salvo (%d pontos)\n", history.size());
-  return true;
-}
+    String statusClass =
+        (soil < 30) ? "danger" :
+        (soil < 52) ? "warn"   : "good";
 
-// Adiciona nova leitura (chamado periodicamente no loop)
-void addReading(int moisture, float tempC, float hum) {
-  Reading r;
-  r.timestamp = millis() / 1000;
-  r.moisture  = constrain(moisture, 0, 100);
-  r.temp      = constrain((int)round(tempC), -20, 80);
-  r.humidity  = constrain((int)round(hum), 0, 100);
+    String statusText =
+        (soil < 30) ? "Needs Water" :
+        (soil < 52) ? "Moderate"    : "Healthy";
 
-  history.push_back(r);
-
-  // Limita o tamanho máximo (remove os mais antigos)
-  while (history.size() > MAX_HISTORY_POINTS) {
-    history.erase(history.begin());
-  }
-
-  // Salva a cada SAVE_INTERVAL_MS
-  unsigned long now = millis();
-  if (now - lastSaveTime >= SAVE_INTERVAL_MS) {
-    saveHistory();
-    lastSaveTime = now;
-  }
-}
-
-// ────────────────────────────────────────────────
-// Handlers Web
-// ────────────────────────────────────────────────
-
-void handleRoot() {
-  digitalWrite(led, HIGH);
-
-  // Leitura inicial (apenas para primeira carga HTML)
-  float hum  = dht.readHumidity();
-  float temp = dht.readTemperature();
-  bool sensorOk = !isnan(hum) && !isnan(temp);
-
-  if (!sensorOk) {
-    hum  = -999;
-    temp = -999;
-  }
-
-  // Umidade do solo
-  float moistMin = 2000.0f;     // probes in water
-  float moistMax = 3344.0f;     // probes in air
-  float moistPercent = 100.0f - ((asoilmoist - moistMin) / (moistMax - moistMin) * 100.0f);
-  moistPercent = constrain(moistPercent, 0.0f, 100.0f);
-  int moistureInt = (int)round(moistPercent);
-
-  // Status
-  String statusClass, statusText, ringColor;
-  if (moistureInt < 30) {
-    statusClass = "danger";
-    statusText  = "Needs Water";
-    ringColor   = "var(--ring-bad)";
-  } else if (moistureInt < 52) {
-    statusClass = "warn";
-    statusText  = "Moderate";
-    ringColor   = "var(--ring-warn)";
-  } else {
-    statusClass = "good";
-    statusText  = "Healthy";
-    ringColor   = "var(--ring-good)";
-  }
+    String ringColor =
+        (soil < 30) ? "var(--ring-bad)" :
+        (soil < 52) ? "var(--ring-warn)" :
+                      "var(--ring-good)";
 
   // ──────────────── HTML ────────────────
   String html = "<!DOCTYPE html>\n";
@@ -225,23 +161,23 @@ void handleRoot() {
   html += "        <circle class=\"gauge-bg\"/>\n";
   html += "        <circle class=\"gauge-progress\" id=\"progress\" stroke=\"" + ringColor + "\" stroke-dasharray=\"490\" stroke-dashoffset=\"490\"></circle>\n";
   html += "      </svg>\n";
-  html += "      <div class=\"gauge-value\" id=\"moistVal\">" + String(moistureInt) + "%</div>\n    </div>\n\n";
+  html += "      <div class=\"gauge-value\" id=\"moistVal\">" + String(soil) + "%</div>\n    </div>\n\n";
   html += "    <div class=\"readings\">\n";
-  html += "      <div class=\"reading\"><div class=\"reading-label\">Temperatura</div><div class=\"reading-value\" id=\"tempVal\">" + (sensorOk ? String(temp, 1) : "–") + " °C</div></div>\n";
-  html += "      <div class=\"reading\"><div class=\"reading-label\">Humidade</div><div class=\"reading-value\" id=\"humVal\">" + (sensorOk ? String(hum, 0) : "–") + " %</div></div>\n";
+  html += "      <div class=\"reading\"><div class=\"reading-label\">Temperatura</div><div class=\"reading-value\" id=\"tempVal\">" + (ok ? String(temp, 1) : "–") + " °C</div></div>\n";
+  html += "      <div class=\"reading\"><div class=\"reading-label\">Humidade</div><div class=\"reading-value\" id=\"humVal\">" + (ok ? String(hum, 0) : "–") + " %</div></div>\n";
   html += "    </div>\n\n";
   html += "    <div class=\"status " + statusClass + "\" id=\"status\">" + statusText + "</div>\n  </div>\n\n";
   html += "  <footer id=\"footer\">ESP32 • by Pedro Lucas</footer>\n\n";
 
-  // JavaScript – atualização dinâmica
+  // JavaScript for dynamic updates and animations
   html += "  <script>\n";
   html += "    const radius = 78;\n";
   html += "    const circ = 2 * Math.PI * radius;\n\n";
 
   html += "    let current = {\n";
-  html += "      moisture: " + String(moistureInt) + ",\n";
-  html += "      temp: \"" + (sensorOk ? String(temp,1) : "–") + "\",\n";
-  html += "      humidity: \"" + (sensorOk ? String(hum,0) : "–") + "\",\n";
+  html += "      moisture: " + String(soil) + ",\n";
+  html += "      temp: \"" + (ok ? String(temp,1) : "–") + "\",\n";
+  html += "      humidity: \"" + (ok ? String(hum,0) : "–") + "\",\n";
   html += "      statusClass: \"" + statusClass + "\",\n";
   html += "      statusText: \"" + statusText + "\",\n";
   html += "      ringColor: \"" + ringColor + "\"\n";
@@ -318,157 +254,107 @@ void handleRoot() {
   html += "</body></html>";
 
   server.send(200, "text/html", html);
-  digitalWrite(led, LOW);
-}
-void handleCurrentData() {
-  float hum  = dht.readHumidity();
-  float temp = dht.readTemperature();
-  bool ok = !isnan(hum) && !isnan(temp);
 
-  float moistMin = 2000.0f;
-  float moistMax = 3344.0f;
-  float moistPercent = 100.0f - ((asoilmoist - moistMin) / (moistMax - moistMin) * 100.0f);
-  moistPercent = constrain(moistPercent, 0.0f, 100.0f);
-  int moistureInt = (int)round(moistPercent);
-
-  String statusClass = (moistureInt < 30) ? "danger" : (moistureInt < 52) ? "warn" : "good";
-  String statusText  = (moistureInt < 30) ? "Needs Water" : (moistureInt < 52) ? "Moderate" : "Healthy";
-  String ringColor   = (moistureInt < 30) ? "var(--ring-bad)" : (moistureInt < 52) ? "var(--ring-warn)" : "var(--ring-good)";
-
-  DynamicJsonDocument doc(512);
-  doc["moisture"]     = moistureInt;
-  doc["temp"]         = ok ? String(temp,1) : "–";
-  doc["humidity"]     = ok ? String(hum,0)  : "–";
-  doc["statusClass"]  = statusClass;
-  doc["statusText"]   = statusText;
-  doc["ringColor"]    = ringColor;
-  doc["uptime"]       = millis() / 1000;
-
-  // Últimos 20 do histórico (para atualização rápida)
-  JsonArray recent = doc.createNestedArray("recent");
-  size_t start = (history.size() > 20) ? history.size() - 20 : 0;
-  for (size_t i = start; i < history.size(); i++) {
-    JsonObject obj = recent.createNestedObject();
-    obj["ts"] = history[i].timestamp;
-    obj["m"]  = history[i].moisture;
-    obj["t"]  = history[i].temp;
-    obj["h"]  = history[i].humidity;
-  }
-
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
+    digitalWrite(LED_PIN, LOW);
 }
 
-void handleFullHistory() {
-  DynamicJsonDocument doc(8192);
-  JsonArray arr = doc.to<JsonArray>();
+// ─────────────────────────────────────────────
+// JSON Data Endpoint
+// ─────────────────────────────────────────────
 
-  for (const auto& r : history) {
-    JsonObject obj = arr.createNestedObject();
-    obj["ts"] = r.timestamp;
-    obj["m"]  = r.moisture;
-    obj["t"]  = r.temp;
-    obj["h"]  = r.humidity;
-  }
+void handleCurrentData()
+{
+    int soil;
+    float temp, hum;
+    bool ok;
 
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
+    readSensors(soil, temp, hum, ok);
+
+    String statusClass =
+        (soil < 30) ? "danger" :
+        (soil < 52) ? "warn"   : "good";
+
+    String statusText =
+        (soil < 30) ? "Needs Water" :
+        (soil < 52) ? "Moderate"    : "Healthy";
+
+    String ringColor =
+        (soil < 30) ? "var(--ring-bad)" :
+        (soil < 52) ? "var(--ring-warn)" :
+                      "var(--ring-good)";
+
+    String json = "{";
+    json += "\"moisture\":" + String(soil) + ",";
+    json += "\"temp\":\"" + (ok ? String(temp,1) : "–") + "\",";
+    json += "\"humidity\":\"" + (ok ? String(hum,0) : "–") + "\",";
+    json += "\"statusClass\":\"" + statusClass + "\",";
+    json += "\"statusText\":\"" + statusText + "\",";
+    json += "\"ringColor\":\"" + ringColor + "\"";
+    json += "}";
+
+    server.send(200, "application/json", json);
 }
 
-void handleHistoryCSV() {
-  String csv = "timestamp,moisture,temp,humidity\n";
-  for (const auto& r : history) {
-    csv += String(r.timestamp) + "," + 
-           String(r.moisture) + "," + 
-           String(r.temp) + "," + 
-           String(r.humidity) + "\n";
-  }
-  server.send(200, "text/csv", csv);
+void handleNotFound()
+{
+    server.send(404, "text/plain", "Not Found");
 }
 
-void handleClearHistory() {
-  history.clear();
-  LittleFS.remove(HISTORY_FILE);
-  server.send(200, "application/json", "{\"status\":\"cleared\"}");
+// ─────────────────────────────────────────────
+// System Initialization
+// ─────────────────────────────────────────────
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(100);
+
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+
+    pinMode(SOIL_PIN, INPUT);
+
+    dht.begin();
+
+    // Reduce CPU frequency to lower power consumption
+    setCpuFrequencyMhz(80);
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting to WiFi");
+
+    while (WiFi.status() != WL_CONNECTED)
+    {
+        delay(300);
+        Serial.print(".");
+    }
+
+    Serial.println("\nConnected");
+    Serial.println("IP Address: " + WiFi.localIP().toString());
+
+    // Enable WiFi power save mode (MAX_MODEM)
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+    // Start mDNS responder
+    if (MDNS.begin("plant"))
+    {
+        Serial.println("mDNS responder started (http://plant.local)");
+    }
+
+    // Register HTTP routes
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/data", HTTP_GET, handleCurrentData);
+    server.onNotFound(handleNotFound);
+
+    server.begin();
 }
 
-void handleNotFound() {
-  server.send(404, "text/plain", "Not Found");
-}
+// ─────────────────────────────────────────────
+// Main Loop
+// ─────────────────────────────────────────────
 
-// ────────────────────────────────────────────────
-// setup & loop
-// ────────────────────────────────────────────────
-
-void setup() {
-  pinMode(led, OUTPUT);
-  digitalWrite(led, LOW);
-  Serial.begin(115200);
-  delay(100);
-
-  if (!LittleFS.begin()) {
-    Serial.println("Falha ao montar LittleFS");
-    while (true) delay(100);
-  }
-  Serial.println("LittleFS montado com sucesso");
-
-  pinMode(32, INPUT);
-
-  // Estabilização sensor solo
-  asoilmoist = analogRead(32);
-  for (int i = 0; i < 80; i++) {
-    asoilmoist = 0.85 * asoilmoist + 0.15 * analogRead(32);
-    delay(22);
-  }
-
-  loadHistory();   // ← carrega histórico persistente
-
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(480);
-    Serial.print(".");
-  }
-  Serial.println("\nIP: " + WiFi.localIP().toString());
-
-  if (MDNS.begin("plant")) {
-    Serial.println("Acesse via http://plant.local");
-  }
-
-  server.on("/",            HTTP_GET, handleRoot);
-  server.on("/data",        HTTP_GET, handleCurrentData);
-  server.on("/history",     HTTP_GET, handleFullHistory);
-  server.on("/history.csv", HTTP_GET, handleHistoryCSV);
-  server.on("/clearhistory",HTTP_GET, handleClearHistory);
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-  Serial.println("Servidor HTTP iniciado");
-
-  dht.begin();
-}
-
-void loop() {
-  server.handleClient();
-
-  // Atualização suave do sensor
-  float raw = analogRead(32);
-  asoilmoist = 0.92 * asoilmoist + 0.08 * raw;
-
-  // Leitura sensores a cada ~5 segundos (exemplo)
-  static unsigned long lastRead = 0;
-  if (millis() - lastRead > 5000) {
-    lastRead = millis();
-
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-
-    float moistP = 100.0f - ((asoilmoist - 2000.0f) / (3344.0f - 2000.0f) * 100.0f);
-    int mInt = constrain((int)round(moistP), 0, 100);
-
-    addReading(mInt, t, h);   // ← adiciona ao histórico
-
-    Serial.printf("Leitura: Solo %d%% | Temp %.1f°C | Umid %.0f%%\n", mInt, t, h);
-  }
+void loop()
+{
+    server.handleClient();
 }
